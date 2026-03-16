@@ -582,6 +582,12 @@ def main() -> int:
             page.on("response", lambda resp: safe_print(f"[response] {resp.status} {resp.url}"))
 
         records = fetch_ipo_list(page, date_str)
+        if not records:
+            print("今日无上市股票")
+            context.close()
+            return 0
+
+
         if args.debug:
             safe_print(f"found {len(records)} records for {date_str}")
 
