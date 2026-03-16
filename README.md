@@ -18,6 +18,8 @@ Output (plain text, per stock):
 首日：开X.XX(+/-X.XX%)，收X.XX(+/-X.XX%)，最高X.XX(+/-X.XX%)，最低X.XX(+/-X.XX%)
 ```
 
+今日无上市股票时，输出空数据
+
 Notes:
 - Percentages are vs offer price.
 - Run time can be slow due to browser automation.
