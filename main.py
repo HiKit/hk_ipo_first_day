@@ -419,27 +419,106 @@ def _human_pause(base_ms: int = 150, jitter_ms: int = 150) -> int:
     return base_ms + random.randint(0, jitter_ms)
 
 
-def _safe_goto(page, url: str, min_text_len: int = 200, debug: bool = False) -> str:
+def _to_half(text: str) -> str:
+    """Convert full-width ASCII characters (e.g. －Ｂ) to half-width (-B)."""
+    if not text:
+        return ""
+    return "".join(
+        chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else c for c in text
+    )
+
+
+def _article_text(page) -> str:
+    """Return the main AASTOCKS article body, isolated from nav/sidebar noise.
+
+    AASTOCKS renders the article inside ``div.newscontent5`` (server-rendered).
+    Prefer that container so regex parsing is not confused by the index ticker
+    bar or the "related news" sidebar. Fall back to the full body when the
+    container is missing.
+    """
+    try:
+        cont = page.evaluate(
+            "() => { const el = document.querySelector('div.newscontent5, div.newscontent, div.NVFCnt'); return el ? (el.innerText || '') : ''; }"
+        )
+        if cont and len(cont.strip()) > 30:
+            return cont
+    except Exception:
+        pass
+    try:
+        return page.evaluate("() => document.body.innerText") or ""
+    except Exception:
+        return ""
+
+
+def _collect_links(page, needles) -> List:
+    try:
+        return (
+            page.evaluate(
+                "(needles) => Array.from(document.querySelectorAll('a'))"
+                ".filter(a => a.textContent && needles.some(n => a.textContent.includes(n)))"
+                ".map(a => [a.textContent.trim(), a.href])",
+                needles,
+            )
+            or []
+        )
+    except Exception:
+        return []
+
+
+def _safe_goto(page, url: str, min_text_len: int = 200, wait_selector=None, debug: bool = False, max_retries: int = 3) -> str:
+    """Navigate to ``url`` and return the page body text.
+
+    AASTOCKS pages often never fire ``DOMContentLoaded`` within a normal
+    timeout (long-lived polling connections), so we navigate with
+    ``wait_until="commit"`` (fires as soon as the response starts) and then
+    actively wait for real content. Retries on timeout / block / short body so
+    a single flaky navigation no longer abandons the whole fetch.
+    """
     if debug:
         safe_print(f"[goto] {url}")
-    for attempt in range(1):
+    last_body = ""
+    for attempt in range(max_retries):
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            page.goto(url, wait_until="commit", timeout=30000)
         except Exception:
             if debug:
-                safe_print(f"[goto] failed attempt {attempt + 1}")
-            continue
-        page.wait_for_timeout(_human_pause(400, 200))
-        body_text = page.evaluate("() => document.body.innerText")
+                safe_print(f"[goto] attempt {attempt + 1} navigate failed")
+        if wait_selector:
+            try:
+                page.wait_for_selector(wait_selector, timeout=12000)
+            except Exception:
+                pass
+        else:
+            # Poll the live DOM for real content instead of a blind fixed wait,
+            # so pages that render slowly (but never fire the lifecycle event)
+            # still get captured.
+            try:
+                page.wait_for_function(
+                    "(min) => { const b = document.body; return !!b && !!(b.innerText) && b.innerText.trim().length >= min; }",
+                    min_text_len,
+                    timeout=15000,
+                )
+            except Exception:
+                pass
+        try:
+            body_text = page.evaluate("() => document.body.innerText") or ""
+        except Exception:
+            body_text = ""
+        last_body = body_text
         if debug:
-            safe_print(f"[goto] text_len={len(body_text)}")
-        if any(block in body_text for block in BLOCK_TEXTS) or len(body_text) < min_text_len:
+            safe_print(f"[goto] attempt {attempt + 1} text_len={len(body_text)}")
+        if any(block in body_text for block in BLOCK_TEXTS):
             if debug:
-                safe_print("[goto] blocked or too short, retrying")
-            page.wait_for_timeout(800 * (attempt + 1))
+                safe_print("[goto] blocked, retrying")
+            page.wait_for_timeout(2000 + 1500 * attempt)
+            continue
+        if len(body_text) < min_text_len:
+            if debug:
+                safe_print("[goto] too short, retrying")
+            page.wait_for_timeout(2000 + 1500 * attempt)
             continue
         return body_text
-    return page.evaluate("() => document.body.innerText")
+    return last_body
 
 
 def _collect_link_hrefs(page, text: str) -> List[str]:
@@ -455,6 +534,21 @@ def _collect_link_hrefs(page, text: str) -> List[str]:
         )
     except Exception:
         return []
+
+
+def _real_article_hrefs(pairs: List) -> List:
+    """Keep only genuine AASTOCKS article permalinks from ``[text, href]`` pairs.
+
+    The news list also links to ``latest-news/AAFN`` *index* pages (not the
+    article body). Those would burn navigation retries, so drop anything that
+    is not the canonical ``/stock-aafn-con/<code>/AAFN/NOW.<id>/hk-stock-news``
+    article URL. Fall back to the original list if nothing matches, so a future
+    URL-format change does not silently break collection.
+    """
+    if not pairs:
+        return []
+    real = [p for p in pairs if p and len(p) == 2 and "/stock-aafn-con/" in p[1] and p[1].rstrip("/").endswith("/hk-stock-news")]
+    return real if real else [p for p in pairs if p and len(p) == 2]
 
 
 def main() -> int:
@@ -482,45 +576,65 @@ def main() -> int:
     def fetch_first_day(page, record: IPORecord) -> Optional[PriceBlock]:
         list_url = AAS_LIST_URL_TEMPLATE.format(code=record.code.replace("-HK", ""))
         try:
-            body_text = _safe_goto(page, list_url, min_text_len=500, debug=args.debug)
-            if any(block in body_text for block in BLOCK_TEXTS) or len(body_text) < 200:
-                if args.manual_wait > 0:
-                    page.wait_for_timeout(args.manual_wait * 1000)
-                    body_text = page.evaluate("() => document.body.innerText")
-                if any(block in body_text for block in BLOCK_TEXTS) or len(body_text) < 200:
-                    return None
+            body_text = _safe_goto(
+                page, list_url, min_text_len=150,
+                wait_selector="a[href*='hk-stock-news']", debug=args.debug,
+            )
         except Exception:
             return None
-
-        hrefs = _collect_link_hrefs(page, DAY1_LINK_TEXT)
-        if not hrefs:
-            page.wait_for_timeout(1500)
-            hrefs = _collect_link_hrefs(page, DAY1_LINK_TEXT)
-        if args.debug:
-            safe_print(f"[first_day] links={len(hrefs)}")
-            if hrefs:
-                safe_print(f"[first_day] href0={hrefs[0]}")
-        if not hrefs:
+        if any(block in body_text for block in BLOCK_TEXTS) or len(body_text) < 100:
             return None
 
-        for href in hrefs[:30]:
-            if not href:
+        hrefs = _collect_links(page, ["全日收", "首日", "挂牌首日", "上市首日"])
+        hrefs = _real_article_hrefs(hrefs)
+        if not hrefs:
+            page.wait_for_timeout(1500)
+            hrefs = _collect_links(page, ["全日收", "首日", "挂牌首日", "上市首日"])
+            hrefs = _real_article_hrefs(hrefs)
+        if args.debug:
+            safe_print(f"[first_day] links={len(hrefs)}")
+            for t, h in hrefs[:8]:
+                safe_print(f"[first_day]   {t[:40]!r} -> {h}")
+
+        # Prefer the "全日收" (full-day close) recap: it already contains the
+        # complete first-day block (open / high-low / close). Avoid "半日收".
+        def score(t):
+            tt = _norm_text(t)
+            if "半日" in tt:
+                return 50
+            if "全日收" in tt:
+                return 0
+            if "首日" in tt:
+                return 1
+            if "挂牌" in tt or "上市首日" in tt:
+                return 2
+            return 9
+
+        hrefs = sorted(hrefs, key=lambda x: score(x[0]))
+
+        code = record.code.replace("-HK", "")
+        name_half = _to_half(record.name)
+        seen = set()
+        for text, href in hrefs[:15]:
+            if not href or href in seen:
                 continue
+            seen.add(href)
 
             try:
-                page.goto(href, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-                page.wait_for_timeout(1500)
+                _safe_goto(
+                    page, href, min_text_len=80,
+                    wait_selector="div.newscontent5", debug=args.debug,
+                )
             except Exception:
                 continue
 
-            article_text = page.evaluate("() => document.body.innerText") or ""
-            if record.code.replace("-HK", "") not in article_text and record.name not in article_text:
+            article_text = _article_text(page)
+            half = _to_half(article_text)
+            if code not in half and name_half not in half:
                 continue
             block = parse_first_day_from_text(article_text)
             if args.debug:
-                preview = article_text[:300].replace("\n", " ").replace(" ", " ")
-                safe_print(f"[first_day] preview: {preview}")
-                safe_print(f"[first_day] parsed: {block}")
+                safe_print(f"[first_day] try {text[:30]!r} parsed={block}")
             if block:
                 return block
 
@@ -529,43 +643,60 @@ def main() -> int:
     def fetch_grey_market(page, record: IPORecord) -> Optional[PriceBlock]:
         list_url = AAS_LIST_URL_TEMPLATE.format(code=record.code.replace("-HK", ""))
         try:
-            body_text = _safe_goto(page, list_url, min_text_len=500, debug=args.debug)
-            if any(block in body_text for block in BLOCK_TEXTS) or len(body_text) < 200:
-                if args.manual_wait > 0:
-                    page.wait_for_timeout(args.manual_wait * 1000)
-                    body_text = page.evaluate("() => document.body.innerText")
-                if any(block in body_text for block in BLOCK_TEXTS) or len(body_text) < 200:
-                    return None
+            body_text = _safe_goto(
+                page, list_url, min_text_len=150,
+                wait_selector="a[href*='hk-stock-news']", debug=args.debug,
+            )
         except Exception:
             return None
-
-        hrefs = _collect_link_hrefs(page, GREY_LINK_TEXT)
-        if not hrefs:
-            page.wait_for_timeout(1500)
-            hrefs = _collect_link_hrefs(page, GREY_LINK_TEXT)
-        if args.debug:
-            safe_print(f"[grey] links={len(hrefs)}")
-            if hrefs:
-                safe_print(f"[grey] href0={hrefs[0]}")
-        if not hrefs:
+        if any(block in body_text for block in BLOCK_TEXTS) or len(body_text) < 100:
             return None
 
-        for href in hrefs[:30]:
-            if not href:
+        hrefs = _collect_links(page, ["暗盘收", "暗盘"])
+        hrefs = _real_article_hrefs(hrefs)
+        if not hrefs:
+            page.wait_for_timeout(1500)
+            hrefs = _collect_links(page, ["暗盘收", "暗盘"])
+            hrefs = _real_article_hrefs(hrefs)
+        if args.debug:
+            safe_print(f"[grey] links={len(hrefs)}")
+            for t, h in hrefs[:8]:
+                safe_print(f"[grey]   {t[:40]!r} -> {h}")
+
+        def score(t):
+            tt = _norm_text(t)
+            if "暗盘收" in tt:
+                return 0
+            if "暗盘" in tt:
+                return 1
+            return 2
+
+        hrefs = sorted(hrefs, key=lambda x: score(x[0]))
+
+        code = record.code.replace("-HK", "")
+        name_half = _to_half(record.name)
+        seen = set()
+        for text, href in hrefs[:15]:
+            if not href or href in seen:
                 continue
+            seen.add(href)
 
             try:
-                page.goto(href, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-                page.wait_for_timeout(1500)
+                _safe_goto(
+                    page, href, min_text_len=80,
+                    wait_selector="div.newscontent5", debug=args.debug,
+                )
             except Exception:
                 continue
 
-            article_text = page.evaluate("() => document.body.innerText") or ""
-            if FUTU_TAG not in article_text:
+            full_text = page.evaluate("() => document.body.innerText") or ""
+            if FUTU_TAG not in full_text:
                 continue
-            if record.code.replace("-HK", "") not in article_text and record.name not in article_text:
+            half = _to_half(full_text)
+            if code not in half and name_half not in half:
                 continue
 
+            article_text = _article_text(page)
             block = parse_grey_market_from_text(article_text)
             if block:
                 return block
