@@ -199,10 +199,14 @@ def _extract_futu_segment(text: str) -> str:
     return text
 
 
-def parse_grey_market_from_text(text: str) -> Optional[PriceBlock]:
+def parse_grey_market_from_text(text: str, title: Optional[str] = None) -> Optional[PriceBlock]:
     if not text:
         return None
-    segment = _extract_futu_segment(text)
+    # Parse the whole isolated article body (``_article_text`` already strips the
+    # nav/sidebar). AASTOCKS embeds MULTIPLE broker grey reports in one article
+    # (富途 / 辉立 / …); the Futu slice alone is frequently incomplete (open only),
+    # so scanning the full body is what recovers close / high / low.
+    segment = text
     open_price = None
     close_price = None
     high_price = None
@@ -250,6 +254,16 @@ def parse_grey_market_from_text(text: str) -> Optional[PriceBlock]:
     match = re.search(r"最低[^\d]{0,6}([0-9]+(?:\.[0-9]+)?)元", segment)
     if match and low_price is None:
         low_price = parse_price(match.group(1))
+
+    # Prefer the article title's grey close (e.g. "《新股》XXX暗盘收报4.64元"):
+    # it is the Futu figure this tool targets and AASTOCKS's own lead summary,
+    # whereas the body may only carry another broker's (e.g. 辉立) close.
+    if title:
+        m = re.search(r"暗盘收报\s*([0-9]+(?:\.[0-9]+)?)元", title)
+        if not m:
+            m = re.search(r"收报\s*([0-9]+(?:\.[0-9]+)?)元", title)
+        if m:
+            close_price = parse_price(m.group(1))
 
     if open_price is None and close_price is not None:
         open_price = close_price
@@ -697,7 +711,7 @@ def main() -> int:
                 continue
 
             article_text = _article_text(page)
-            block = parse_grey_market_from_text(article_text)
+            block = parse_grey_market_from_text(article_text, title=text)
             if block:
                 return block
 
